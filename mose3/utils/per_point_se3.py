@@ -9,62 +9,7 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 
-from .se3_fit import weighted_centroids, solve_rotation_horn
-
-
-def _rotmat_to_quat_wxyz(R: torch.Tensor) -> torch.Tensor:
-    """Convert rotation matrices [..., 3, 3] → unit quaternions [..., 4] (wxyz).
-
-    Numerically stable branch on the largest diagonal element (Shoemake).
-    """
-    m = R
-    trace = m[..., 0, 0] + m[..., 1, 1] + m[..., 2, 2]
-    eps = 1e-12
-
-    cond_trace = trace > 0
-    cond_d0 = (~cond_trace) & (m[..., 0, 0] >= m[..., 1, 1]) & (m[..., 0, 0] >= m[..., 2, 2])
-    cond_d1 = (~cond_trace) & (~cond_d0) & (m[..., 1, 1] >= m[..., 2, 2])
-    cond_d2 = (~cond_trace) & (~cond_d0) & (~cond_d1)
-
-    s = torch.sqrt(trace.clamp_min(eps) + 1.0) * 2.0
-    q_trace = torch.stack([
-        0.25 * s,
-        (m[..., 2, 1] - m[..., 1, 2]) / s.clamp_min(eps),
-        (m[..., 0, 2] - m[..., 2, 0]) / s.clamp_min(eps),
-        (m[..., 1, 0] - m[..., 0, 1]) / s.clamp_min(eps),
-    ], dim=-1)
-
-    s0 = torch.sqrt((1.0 + m[..., 0, 0] - m[..., 1, 1] - m[..., 2, 2]).clamp_min(eps)) * 2.0
-    q_d0 = torch.stack([
-        (m[..., 2, 1] - m[..., 1, 2]) / s0.clamp_min(eps),
-        0.25 * s0,
-        (m[..., 0, 1] + m[..., 1, 0]) / s0.clamp_min(eps),
-        (m[..., 0, 2] + m[..., 2, 0]) / s0.clamp_min(eps),
-    ], dim=-1)
-
-    s1 = torch.sqrt((1.0 + m[..., 1, 1] - m[..., 0, 0] - m[..., 2, 2]).clamp_min(eps)) * 2.0
-    q_d1 = torch.stack([
-        (m[..., 0, 2] - m[..., 2, 0]) / s1.clamp_min(eps),
-        (m[..., 0, 1] + m[..., 1, 0]) / s1.clamp_min(eps),
-        0.25 * s1,
-        (m[..., 1, 2] + m[..., 2, 1]) / s1.clamp_min(eps),
-    ], dim=-1)
-
-    s2 = torch.sqrt((1.0 + m[..., 2, 2] - m[..., 0, 0] - m[..., 1, 1]).clamp_min(eps)) * 2.0
-    q_d2 = torch.stack([
-        (m[..., 1, 0] - m[..., 0, 1]) / s2.clamp_min(eps),
-        (m[..., 0, 2] + m[..., 2, 0]) / s2.clamp_min(eps),
-        (m[..., 1, 2] + m[..., 2, 1]) / s2.clamp_min(eps),
-        0.25 * s2,
-    ], dim=-1)
-
-    q = torch.where(cond_trace.unsqueeze(-1), q_trace, q_d0)
-    q = torch.where(cond_d1.unsqueeze(-1), q_d1, q)
-    q = torch.where(cond_d2.unsqueeze(-1), q_d2, q)
-
-    sign = torch.where(q[..., 0:1] < 0, -1.0, 1.0).to(q.dtype)
-    q = q * sign
-    return F.normalize(q, dim=-1, eps=1e-12)
+from .se3_fit import solve_rotation_horn
 
 
 def _sample_ref_indices(
@@ -102,6 +47,9 @@ def fit_per_pixel_se3(
 
     Returns a dict of CPU tensors: ``quat`` [T, H, W, 4] (wxyz) and ``trans`` [T, H, W, 3] with
     x_t = R(quat) x_query + trans, and ``ok`` [T, H, W] (the fit was well conditioned).
+
+    Query-to-reference weights depend only on the query frame. Reuse each chunk's
+    weights and source centroid across target frames without caching a full P-by-reference matrix.
     """
     assert tracks.shape[:3] == rigidity_emb.shape[:3], (
         f"shape mismatch tracks={tuple(tracks.shape)} emb={tuple(rigidity_emb.shape)}"
@@ -133,32 +81,43 @@ def fit_per_pixel_se3(
 
     inv_temp = 1.0 / max(float(temperature), 1e-6)
 
-    for t in range(T):
-        if t == query_idx:
-            continue
-        ref_dst = tracks[t].reshape(P, 3).to(device).float().index_select(0, ref_idx)
+    if T > 1:
+        ref_dst_all = torch.stack([
+            tracks[t].reshape(P, 3).to(device).float().index_select(0, ref_idx)
+            for t in range(T)
+        ])
+        ref_outer = ref_src[None, :, :, None] * ref_dst_all[:, :, None, :]
         for s in range(0, P, chunk_size):
             e = min(s + chunk_size, P)
             chunk_emb_n = src_emb_n[s:e]
-            logits = (chunk_emb_n @ ref_emb_n.T) * inv_temp
+            logits = chunk_emb_n @ ref_emb_n.T
+            logits.mul_(inv_temp)
             if sigma_px > 0:  # spatial Gaussian on query-frame pixel distance
                 pix = torch.arange(s, e, device=device)
                 dh = (pix // W).float()[:, None] - ref_h[None]
                 dw = (pix % W).float()[:, None] - ref_w[None]
                 logits = logits - (dh * dh + dw * dw) / (2.0 * sigma_px ** 2)
+                del pix, dh, dw
             w = F.softmax(logits, dim=-1)
-            w = w / (w.sum(dim=-1, keepdim=True).clamp_min(1e-8))
+            del logits
+            w.div_(w.sum(dim=-1, keepdim=True).clamp_min(1e-8))
+            src_mean = w @ ref_src
+            for t in range(T):
+                if t == query_idx:
+                    continue
+                dst_mean = w @ ref_dst_all[t]
+                weighted_outer = torch.einsum("qk,kab->qab", w, ref_outer[t])
+                cov = weighted_outer - src_mean.unsqueeze(-1) * dst_mean.unsqueeze(-2)
+                horn = solve_rotation_horn(cov, eig_min_gap=1e-4, eig_jitter=1e-6)
+                R = horn["R"]
+                sol_ok = horn["ok"]
+                tr = dst_mean - (src_mean.unsqueeze(1) @ R.transpose(-2, -1)).squeeze(1)
+                sol_ok = sol_ok & torch.isfinite(tr).all(dim=-1)
 
-            src_mean, dst_mean, _, _, cov = weighted_centroids(ref_src, ref_dst, w)
-            horn = solve_rotation_horn(cov, eig_min_gap=1e-4, eig_jitter=1e-6)
-            R = horn["R"]
-            sol_ok = horn["ok"]
-            tr = dst_mean - (src_mean.unsqueeze(1) @ R.transpose(-2, -1)).squeeze(1)
-            sol_ok = sol_ok & torch.isfinite(tr).all(dim=-1)
-
-            quat[t, s:e] = _rotmat_to_quat_wxyz(R)
-            trans[t, s:e] = tr
-            ok[t, s:e] = sol_ok
+                quat[t, s:e] = horn["quat"]
+                trans[t, s:e] = tr
+                ok[t, s:e] = sol_ok
+            del w  # Do not retain the previous chunk's large weight matrix.
 
     return {
         "quat":  quat.reshape(T, H, W, 4).cpu(),

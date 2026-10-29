@@ -114,7 +114,8 @@ def solve_rotation_horn(
     quat = eigenvectors[:, :, -1]  # [Q, 4] = [w, x, y, z]
 
     # canonical sign: w >= 0
-    sign = torch.where(quat[:, 0:1] < 0, torch.tensor(-1.0, device=cov.device, dtype=cov.dtype), torch.tensor(1.0, device=cov.device, dtype=cov.dtype))
+    # Scalar operands avoid constructing and uploading two CUDA tensors per fit batch.
+    sign = torch.where(quat[:, 0:1] < 0, -1.0, 1.0).to(dtype=cov.dtype)
     quat = quat * sign
 
     quat = F.normalize(quat, dim=-1, eps=1e-12)
@@ -125,6 +126,7 @@ def solve_rotation_horn(
 
     return {
         "R": R,
+        "quat": quat,
         "ok": ok,
         "projected_ok": projected_ok,
         "raw_eigenvalues": raw_eigenvalues,
