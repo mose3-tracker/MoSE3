@@ -18,6 +18,7 @@
 
 ## Updates
 
+- **[Oct 2026]** [Evaluation code](https://github.com/mose3-tracker/MoSE3/tree/evaluation) for the SE(3) benchmarks (HO3D, iTACO, YCBInEOAT) released.
 - **[Oct 2026]** [Art-Kubric generation code](https://github.com/mose3-tracker/Art-Kubric) and [dataset](https://huggingface.co/datasets/mose3-tracker/Art-Kubric) released.
 - **[Oct 2026]** Inference code and model weights released.
 
@@ -121,7 +122,7 @@ and width, and trail lengths are sliders in the GUI.
 
 - [x] Inference code and model weights
 - [x] [Art-Kubric dataset repository](https://huggingface.co/datasets/mose3-tracker/Art-Kubric) and [generation pipeline](https://github.com/mose3-tracker/Art-Kubric)
-- [ ] Evaluation code
+- [x] [Evaluation code](https://github.com/mose3-tracker/MoSE3/tree/evaluation) (SE(3) benchmarks)
 - [ ] Training code
 
 ## Acknowledgements
