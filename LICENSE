@@ -41,6 +41,8 @@ Third-party files keep their own licenses (full texts in licenses/):
   mose3/models/layers/camera_head.py
       adapted from marepo, Copyright © Niantic, Inc. 2018. All rights reserved.
       marepo license (non-commercial).
+  evaluation/alignment.py
+      adapted from MoGe, Copyright (c) Microsoft Corporation. MIT.
 
 The model weights (which include the Pi3 weights) are released under
 CC BY-NC 4.0: https://creativecommons.org/licenses/by-nc/4.0/

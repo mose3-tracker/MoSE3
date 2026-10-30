@@ -12,127 +12,149 @@
 \* Equal contribution
 </div>
 
-<p align="center">
-  <img src="assets/teaser_dress.gif" width="100%" alt="MoSE3 on a twirling dress">
-</p>
+# MoSE3 Evaluation
 
-## Updates
+This branch reproduces the SE(3) estimation results of MoSE3 on [HO3D](https://github.com/shreyashampali/ho3d),
+[iTACO](https://github.com/3dlg-hcvc/video2articulation) and
+[YCBInEOAT](https://github.com/wenbowen123/iros20-6d-pose-tracking), at the per-pixel
+and at the object/part level. To run MoSE3 on your own videos, see the
+[main branch](https://github.com/mose3-tracker/MoSE3).
 
-- **[Oct 2026]** [Art-Kubric generation code](https://github.com/mose3-tracker/Art-Kubric) and [dataset](https://huggingface.co/datasets/mose3-tracker/Art-Kubric) released.
-- **[Oct 2026]** Inference code and model weights released.
-
-## Overview
-
-**MoSE3** is a feed-forward model that predicts world-space **SE(3) motion for every pixel** of a
-monocular RGB video, generalizing across **rigid, articulated and deformable objects**.
-
-## Quick Start
-
-### Installation
+## Installation
 
 ```bash
-git clone https://github.com/mose3-tracker/MoSE3.git
+git clone -b evaluation https://github.com/mose3-tracker/MoSE3.git
 cd MoSE3
-conda create -n mose3 python=3.10 -y
-conda activate mose3
-pip install torch==2.6.0 --index-url https://download.pytorch.org/whl/cu126   # tested with CUDA 12.6
-pip install -r requirements.txt
-pip install -r requirements_demo.txt   # optional: the interactive 3D viewer
 ```
 
-No custom CUDA extension is needed. `pip install -e .` makes `mose3` importable from anywhere.
-
-### Model weights
-
-Download the weights from [Hugging Face](https://huggingface.co/mose3-tracker/MoSE3) into `ckpt/`:
+Set up the conda environment and PyTorch as in the main branch's
+[Installation](https://github.com/mose3-tracker/MoSE3#installation), and download the weights into `ckpt/` as in
+its [Model weights](https://github.com/mose3-tracker/MoSE3#model-weights). Then, in the same environment,
+install the evaluation dependencies:
 
 ```bash
-hf download mose3-tracker/MoSE3 --local-dir ckpt
+pip install -r requirements_eval.txt
 ```
 
-### Run
+## Benchmark data
+
+Download the pre-built benchmark caches (2.1 GB) from
+[mose3-tracker/mose3-eval](https://huggingface.co/datasets/mose3-tracker/mose3-eval) into `data/se3_bench/`.
+The dataset is gated: accept its terms on the dataset page and log in with `hf auth login`, then download:
 
 ```bash
-# 1. inference: video -> outputs/spin/predictions.npz
-python inference.py --ckpt ckpt --video examples/spin.mp4 --num_frames 40
-
-# 2. 2D visualizations -> outputs/spin/{tracks,se3,rigidity}.mp4
-python visualize.py --clip outputs/spin
-
-# 3. interactive 3D viewer -> http://localhost:8080
-python visualize_viser.py --clip outputs/spin --port 8080
+hf download mose3-tracker/mose3-eval --repo-type dataset --local-dir data/se3_bench
 ```
 
-- Inputs: `--video`, `--image_dir` (frames ordered by the numbers in their file names), or `--json`
-  with a list of clips (same keys as the flags; see `examples/demo.json`).
-- SE(3) fit: `--num_ref_pts` (default 12000) is the number of query-frame pixels each fit pools over.
-  For locally deforming surfaces such as cloth, add `--se3_dist_weight` to also weight that pool by
-  pixel distance (`--se3_sigma_px`, default 8 px). The `demo.json` clips use it.
-- `python inference.py --help` lists every option. The keys of `predictions.npz` are documented in
-  `run_clip` in `inference.py`.
-
-### In Python
-
-```python
-import torch
-from mose3.models.mose3 import MoSE3
-from mose3.utils.per_point_se3 import fit_per_pixel_se3
-
-model = MoSE3.from_pretrained("ckpt", strict=True).cuda().eval()   # local folder
-# model = MoSE3.from_pretrained("mose3-tracker/MoSE3", strict=True).cuda().eval()   # or straight from the Hub
-
-imgs = ...  # (1, N, 3, H, W) float in [0, 1]; H and W multiples of 14
-with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
-    out = model(imgs, query_frame_idx=0)   # the frame whose pixels are tracked
-
-tracks_local = out["tracks_local"][0].float()   # (N, H, W, 3) 3D track of every query pixel, in each frame's camera
-rigidity_emb = out["rigidity_emb"][0].float()   # (N, H, W, 16)
-
-# express the tracks in the first camera's coordinate frame, then fit a rigid transform per query pixel
-c2w = out["camera_poses"][0].float()
-c2w = torch.linalg.inv(c2w[:1]) @ c2w
-tracks = torch.einsum("tij,thwj->thwi", c2w[:, :3, :3], tracks_local) + c2w[:, None, None, :3, 3]
-se3 = fit_per_pixel_se3(tracks, rigidity_emb, query_idx=0)   # sigma_px=8.0: also weight by pixel distance
-
-se3["quat"], se3["trans"]   # (N, H, W, 4) wxyz and (N, H, W, 3): x_t = R x_query + t, in the first camera's frame
+```
+data/se3_bench/
+  ho3d/        54 clips
+  itaco/       55 clips
+  ycbineoat/    9 clips
 ```
 
-## Visualization
+<details>
+<summary>Cache format</summary>
 
-Both tools read only `predictions.npz` and lay a grid of query points over the query frame
-(`--stride`, default 48 px).
+Each clip is one `<clip>.npz` with T = 50 frames (49 on YCBInEOAT) at 480 x 640 and N = 3072 query pixels
+at frame 0:
 
-`visualize.py` writes, each video as `input | visualization`:
+| key | shape | |
+|---|---|---|
+| `images` | [T, H, W, 3] uint8 | RGB frames |
+| `query_uv` | [N, 2] | (x, y) query pixels at frame 0 |
+| `intrinsics` | [4] | (fx, fy, cx, cy) in pixels, for methods that take them; not used by the evaluation |
+| `tracks_cam` | [T, N, 3] | GT 3D tracks, in the first camera's frame |
+| `obj_se3_per_point` | [T, N, 4, 4] | GT pose of each query's rigid body at every frame, in the first camera's frame; only valid where `has_gt_se3` is true |
+| `vis` | [T, N] bool | GT visibility |
+| `has_gt_se3` | [N] bool | the query has a GT pose: it lies on the object (iTACO: on any of the object's parts) |
+| `metric_mask` | [N] bool | the scored queries: the object (HO3D, YCBInEOAT) or its moving part (iTACO) |
+| `actor_idx` | [N] int8 | 0 = the object (YCBInEOAT) or its moving part (iTACO), 1 = everything else; all 0 on HO3D |
 
-- `query_points.png`: the grid on the query frame
-- `tracks.mp4`: the predicted 3D tracks with a fading trail (hollow dot = occluded)
-- `se3.mp4`: each point's SE(3) motion as a moving x/y/z frame, placed at the query-frame point moved
-  by its SE(3); at the query frame blue z is the outward surface normal, and frames of occluded points
-  are dashed
-- `rigidity.mp4`: rigidity embedding, PCA → RGB
+The predicted tracks are aligned to the GT on the `has_gt_se3` queries and scored on the `metric_mask` queries.
+On HO3D and YCBInEOAT the two masks are the same. The GT SE(3) of query `n` from frame 0 to frame `t`, which
+RRE and ADD are measured against, is `obj_se3_per_point[t, n] @ inv(obj_se3_per_point[0, n])`.
 
-`visualize_viser.py` shows the dense tracks as a moving 3D point cloud, coloured by RGB or by the
-rigidity embedding, with the same SE(3) frames and the trails of the tracks. Point size, axis length
-and width, and trail lengths are sliders in the GUI.
+</details>
 
-`--help` lists the options of both tools.
+## Run
 
-## Checklist
+All three benchmarks, then the table:
 
-- [x] Inference code and model weights
-- [x] [Art-Kubric dataset repository](https://huggingface.co/datasets/mose3-tracker/Art-Kubric) and [generation pipeline](https://github.com/mose3-tracker/Art-Kubric)
-- [ ] Evaluation code
-- [ ] Training code
+```bash
+bash evaluation/eval_se3.sh data/se3_bench ckpt
+```
 
-## Acknowledgements
+or step by step, here for HO3D:
 
-MoSE3 uses [π³](https://github.com/yyfz/Pi3) as its frozen geometry branch, and this repository
-includes π³'s model code and weights. It also contains code from
-[DINOv2](https://github.com/facebookresearch/dinov2), [CroCo](https://github.com/naver/croco),
-[DUSt3R](https://github.com/naver/dust3r) and [marepo](https://github.com/nianticlabs/marepo).
-The model is trained on Art-Kubric, Kubric, PointOdyssey, Dynamic Replica, SynthVerse and Syn4D. The example
-videos are from [Pexels](https://www.pexels.com) and the [DyCheck](https://github.com/KAIR-BAIR/dycheck)
-iPhone dataset. We thank the authors of all of these.
+```bash
+# 1. predictions at the query pixels -> outputs/se3_bench/ho3d/preds/mose3/<clip>.npz
+python evaluation/run_inference.py --ckpt ckpt --cache_dir data/se3_bench/ho3d \
+    --out_dir outputs/se3_bench/ho3d/preds/mose3
+
+# 2. per-clip metrics -> outputs/se3_bench/ho3d/metrics/mose3/summary.csv
+python evaluation/compute_metrics.py --cache_dir data/se3_bench/ho3d \
+    --preds_dir outputs/se3_bench/ho3d/preds/mose3 --out_dir outputs/se3_bench/ho3d/metrics/mose3 --clean_gt
+
+# 3. averages over clips
+python evaluation/make_table.py --root outputs/se3_bench --methods mose3 --benchmarks ho3d
+```
+
+`--clean_gt` (HO3D and iTACO) drops GT points with broken depth: unprojected from a depth hole or from
+the background through the mask border.
+
+## Protocol
+
+Each clip is scored in four steps:
+
+1. **Scale alignment.** One scale and xyz shift per clip, fitted to the GT on visible labelled points
+   ([MoGe](https://github.com/microsoft/MoGe)'s solver).
+2. **Per-pixel SE(3).** For each query pixel, fit the SE(3) from frame 0 to frame t on the predicted tracks
+   of a group of support points (Horn's method). How the support points are chosen differs between `emb`
+   and `knn` (table below).
+3. **Object/part-level SE(3).** HDBSCAN (min cluster size 30) clusters the query pixels into rigid parts. The
+   cluster that overlaps the GT object best (highest IoU) is taken as the object, and one rigid motion per
+   frame is fitted to the tracks of all its pixels.
+4. **Metrics**, on the scored queries at frames t > 0:
+   - RRE (degrees) and ADD (cm), per pixel and per object
+   - RRE-AUC up to 30° (per pixel)
+   - ADD-AUC: area under the accuracy curve up to 10 cm (20 cm on iTACO), as in YCB-Video
+   - IoU of the chosen group (per object)
+
+The two SE(3) protocols differ only in steps 2 and 3:
+
+| | `emb` (MoSE3) | `knn` (any point tracker) |
+|---|---|---|
+| Step 2: support points | all query pixels, weighted by rigidity-embedding similarity (softmax, temperature 0.01) | the K nearest 3D neighbours at frame 0, equal weights |
+| Step 3: grouped by | rigidity embeddings | per-pixel SE(3)s |
+| K | — | K in {4, ..., 256}, chosen per clip by the best z-scored sum of the metrics, separately for the per-pixel and the object-level columns |
+
+**Small objects.** An object with fewer than 30 query pixels cannot form its own cluster in step 3. To allow
+it, pass `--adaptive_min_cluster` to `compute_metrics.py`: on those clips (2 in HO3D, 2 in iTACO, 3 in
+YCBInEOAT) the minimum cluster size becomes the object's number of query pixels. The expected results below
+use the default of 30.
+
+## Expected results
+
+`make_table.py` output with the released weights. `emb` is MoSE3 with its rigidity embeddings; `knn` applies
+the k-NN protocol to MoSE3's tracks. ADD is in cm.
+
+| | | Per-pixel | | | | Object/part level | | | |
+|---|---|---|---|---|---|---|---|---|---|
+| **Benchmark** | **SE(3)** | **RRE ↓** | **RRE-AUC ↑** | **ADD ↓** | **ADD-AUC ↑** | **IoU ↑** | **RRE ↓** | **ADD ↓** | **ADD-AUC ↑** |
+| HO3D | `emb` | 18.28 | 0.569 | 2.16 | 78.55 | 0.709 | 17.96 | 2.06 | 80.24 |
+| | `knn` | 24.09 | 0.509 | 2.61 | 74.37 | 0.504 | 20.04 | 2.26 | 78.35 |
+| iTACO | `emb` | 12.30 | 0.741 | 11.37 | 59.42 | 0.784 | 10.76 | 10.49 | 62.51 |
+| | `knn` | 20.78 | 0.570 | 14.47 | 50.13 | 0.505 | 9.87 | 10.27 | 63.06 |
+| YCBInEOAT | `emb` | 14.89 | 0.588 | 3.98 | 62.76 | 0.498 | 11.93 | 4.00 | 63.83 |
+| | `knn` | 17.97 | 0.546 | 4.50 | 59.45 | 0.171 | 14.02 | 3.67 | 65.85 |
+
+## Evaluating other methods
+
+Any method that predicts 3D point tracks can be scored with the `knn` protocol. Write one
+`outputs/se3_bench/<benchmark>/preds/<method>/<clip>.npz` per cached clip with `pred_tracks_cam0`
+[T, N, 3], the 3D tracks of the cached query pixels in the first camera's frame. Add `rigid_emb`
+[T, N, D] for the `emb` protocol. Then run steps 2 and 3 with `--methods mose3 <method>`.
 
 ## Citation
 
